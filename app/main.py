@@ -2,7 +2,7 @@ import json
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 
 from fastapi import Body, FastAPI, Path, Query
 from fastapi.responses import JSONResponse
@@ -1059,6 +1059,14 @@ def list_quarantine(
 def compact(req: CompactIn):
     """压缩归档 (当前锚点, cutoff_seq] 的连续事件前缀。
 
+    - 归档前缀校验: 从当前锚点起, 按与 /integrity 完全一致的哈希规范逐条核对
+      拟删除区间——序号连续性(首条须为 anchor_seq + 1, 相邻 seq 逐一递增)、
+      前后哈希衔接(prev_hash 等于上一条/锚点 hash)、事件内容哈希(按固定 JSON
+      规范重算)。首个断点即返回 **409**, 响应给出断点的 seq/event_id/reason
+      (reason 取值沿用 /integrity: seq_gap / prev_hash_mismatch /
+      hash_mismatch); dry_run 同样校验、同样 409。任一情况下事件、日计数视图
+      与链锚点均保持原状(不写库)。断点不在拟归档前缀内时, 既有连续区间仍可
+      按边界正常归档。
     - 安全边界: cutoff_seq 不得超过所有已登记 consumer 的最小 cursor_seq;
       无 consumer 时以当前最大 seq 为边界。越界返回 409 并给出 safe_through_seq。
     - 执行时持久化最后一条被删记录的 seq/hash 作为链锚点, /integrity 从锚点继续校验。
@@ -1066,22 +1074,22 @@ def compact(req: CompactIn):
     - 只物理删除 events 中的事件内容; received_event_ids 中的 event_id 占用
       **刻意保留**, 故归档后同一 ID 重投仍判 duplicate(不分配新 seq、不重复投递)。
     - dry_run=true 只返回预计删除数与边界, 不写库。
-    - cutoff_seq 已被既往压缩覆盖时为幂等空操作, 不再校验安全边界。
+    - cutoff_seq 已被既往压缩覆盖时为幂等空操作, 不再校验安全边界与前缀。
     """
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         anchor_seq, anchor_hash = get_chain_anchor(conn)
 
-        # 安全边界: 已登记 consumer 的最小游标; 一个都没有时为当前最大 seq
-        row = conn.execute("SELECT MIN(cursor_seq) AS m FROM consumers").fetchone()
-        if row["m"] is not None:
-            safe_through_seq = row["m"]
-        else:
-            row = conn.execute("SELECT MAX(id) AS m FROM events").fetchone()
-            safe_through_seq = row["m"] or 0
-
         # 幂等: 请求区间已被既往压缩覆盖, 无记录可删, 直接返回
         if req.cutoff_seq <= anchor_seq:
+            # 安全边界: 已登记 consumer 的最小游标; 一个都没有时为当前最大 seq
+            row = conn.execute("SELECT MIN(cursor_seq) AS m FROM consumers").fetchone()
+            if row["m"] is not None:
+                safe_through_seq = row["m"]
+            else:
+                row = conn.execute("SELECT MAX(id) AS m FROM events").fetchone()
+                safe_through_seq = row["m"] or 0
+
             result: dict[str, Any] = {
                 "dry_run": req.dry_run,
                 "from_seq": anchor_seq + 1,
@@ -1098,6 +1106,34 @@ def compact(req: CompactIn):
                 "anchor_hash": anchor_hash,
             }
 
+        # 拟归档前缀: (锚点, cutoff_seq] 内的现存事件, 按 seq 升序
+        rows = conn.execute(
+            "SELECT id, event_id, occurred_at, payload, received_at, prev_hash, hash"
+            " FROM events WHERE id > ? AND id <= ? ORDER BY id",
+            (anchor_seq, req.cutoff_seq),
+        ).fetchall()
+        # 归档前必须与 /integrity 同口径核对整条拟删前缀; 首个断点即拒绝归档,
+        # 否则把被篡改记录的(错误)hash 写入锚点会销毁 /integrity 赖以检出的证据
+        _checked, first_break = verify_chain_prefix(rows, anchor_seq, anchor_hash)
+        if first_break is not None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "chain verification failed within compact prefix",
+                    "cutoff_seq": req.cutoff_seq,
+                    "dry_run": req.dry_run,
+                    "first_break": first_break,
+                },
+            )
+
+        # 安全边界: 已登记 consumer 的最小游标; 一个都没有时为当前最大 seq
+        row = conn.execute("SELECT MIN(cursor_seq) AS m FROM consumers").fetchone()
+        if row["m"] is not None:
+            safe_through_seq = row["m"]
+        else:
+            row = conn.execute("SELECT MAX(id) AS m FROM events").fetchone()
+            safe_through_seq = row["m"] or 0
+
         if req.cutoff_seq > safe_through_seq:
             return JSONResponse(
                 status_code=409,
@@ -1108,20 +1144,8 @@ def compact(req: CompactIn):
                 },
             )
 
-        # 连续前缀: 从锚点后一条起逐条连续, 遇断档即止
-        rows = conn.execute(
-            "SELECT id, occurred_at, payload, hash FROM events"
-            " WHERE id > ? AND id <= ? ORDER BY id",
-            (anchor_seq, req.cutoff_seq),
-        ).fetchall()
-        prefix: list[sqlite3.Row] = []
-        expected = anchor_seq + 1
-        for r in rows:
-            if r["id"] != expected:
-                break
-            prefix.append(r)
-            expected += 1
-
+        # 校验通过: 取回的行即从锚点后一条起的连续前缀
+        prefix = rows
         from_seq = anchor_seq + 1
         through_seq = prefix[-1]["id"] if prefix else anchor_seq
 
@@ -1179,6 +1203,51 @@ def _chain_break(checked: int, seq: int, event_id: str, reason: str) -> dict[str
     }
 
 
+def verify_chain_prefix(
+    rows: Sequence[sqlite3.Row], anchor_seq: int, anchor_hash: str
+) -> tuple[int, Optional[dict[str, Any]]]:
+    """从给定锚点出发, 按现有哈希规范逐条校验 rows(须按 seq 升序)。
+
+    校验项与 /integrity 完全一致、按同样顺序:
+      1. 序号连续性: 首条须为 anchor_seq + 1, 其后相邻 seq 逐一递增(seq_gap);
+      2. 前后哈希衔接: prev_hash 等于上一条的 hash, 首条等于锚点哈希
+         (prev_hash_mismatch);
+      3. 内容哈希: 按固定 JSON 规范重算并与存储的 hash 比对(hash_mismatch)。
+    返回 (断点前已通过校验的记录数, 首个断点); 全部通过时断点为 None。
+    /integrity 与 /retention/compact 共用本函数, 保证两处取值与判定口径一致。
+    """
+    checked = 0
+    prev_seq = anchor_seq
+    prev_hash = anchor_hash
+    for row in rows:
+        seq = row["id"]
+        if seq != prev_seq + 1:
+            return checked, {"seq": seq, "event_id": row["event_id"], "reason": "seq_gap"}
+        if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
+            return checked, {
+                "seq": seq,
+                "event_id": row["event_id"],
+                "reason": "prev_hash_mismatch",
+            }
+        if row["hash"] is None or row["hash"] != record_hash(
+            seq=seq,
+            event_id=row["event_id"],
+            occurred_at=row["occurred_at"],
+            payload=json.loads(row["payload"]),
+            received_at=row["received_at"],
+            prev_hash=row["prev_hash"],
+        ):
+            return checked, {
+                "seq": seq,
+                "event_id": row["event_id"],
+                "reason": "hash_mismatch",
+            }
+        checked += 1
+        prev_seq = seq
+        prev_hash = row["hash"]
+    return checked, None
+
+
 @app.get("/integrity")
 def integrity():
     """从链锚点开始校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。
@@ -1194,30 +1263,11 @@ def integrity():
             (anchor_seq,),
         ).fetchall()
 
-    checked = 0
-    prev_seq = anchor_seq
-    prev_hash = anchor_hash
-    for row in rows:
-        seq = row["id"]
-        # 序号连续性: 相邻记录 seq 必须逐一递增(首条须为锚点 seq + 1)
-        if seq != prev_seq + 1:
-            return _chain_break(checked, seq, row["event_id"], "seq_gap")
-        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为锚点哈希)
-        if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
-            return _chain_break(checked, seq, row["event_id"], "prev_hash_mismatch")
-        # 事件字段: 按固定 JSON 规范重算哈希并与存储值比对
-        if row["hash"] is None or row["hash"] != record_hash(
-            seq=seq,
-            event_id=row["event_id"],
-            occurred_at=row["occurred_at"],
-            payload=json.loads(row["payload"]),
-            received_at=row["received_at"],
-            prev_hash=row["prev_hash"],
-        ):
-            return _chain_break(checked, seq, row["event_id"], "hash_mismatch")
-        checked += 1
-        prev_seq = seq
-        prev_hash = row["hash"]
+    checked, first_break = verify_chain_prefix(rows, anchor_seq, anchor_hash)
+    if first_break is not None:
+        return _chain_break(
+            checked, first_break["seq"], first_break["event_id"], first_break["reason"]
+        )
 
     return {
         "verified": True,
